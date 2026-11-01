@@ -1,13 +1,8 @@
 import { NextRequest } from 'next/server';
-import Anthropic from '@anthropic-ai/sdk';
 
 export const runtime = 'edge';
 import type { ZiweiChart } from '@/lib/ziwei/types';
 import { STEMS, BRANCHES, STAR_DESCRIPTIONS } from '@/lib/ziwei/constants';
-
-const client = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-});
 
 function buildChartContext(chart: ZiweiChart): string {
   const { birthInfo, lunarInfo, mingGongBranch, shenGongBranch, wuxingJuName, palaces, daXians, currentDaXianIndex, currentAge } = chart;
@@ -323,55 +318,119 @@ interface RequestBody {
 
 export async function POST(req: NextRequest) {
   try {
-    const { chart, messages }: RequestBody = await req.json();
+    if (!process.env.OPENAI_API_KEY) {
+      return Response.json({ error: '服务端尚未配置 OPENAI_API_KEY' }, { status: 503 });
+    }
 
-    if (!chart || !messages?.length) {
-      return new Response('缺少命盘数据', { status: 400 });
+    const body = await req.json() as RequestBody;
+    const { chart, messages } = body;
+
+    if (!chart || !Array.isArray(messages) || messages.length === 0) {
+      return new Response('缺少命盘数据或对话内容', { status: 400 });
+    }
+    if (messages.length > 40 || messages.some(m =>
+      !m || (m.role !== 'user' && m.role !== 'assistant') ||
+      typeof m.content !== 'string' || m.content.length > 12000
+    )) {
+      return new Response('对话格式无效或内容过长', { status: 400 });
     }
 
     const chartContext = buildChartContext(chart);
-    const systemWithContext = `${SYSTEM_PROMPT}\n\n---\n\n以下是命主的完整命盘数据，请基于此进行解读：\n\n${chartContext}`;
+    const instructions = `${SYSTEM_PROMPT}\n\n---\n\n以下是命主的完整命盘数据，请基于此进行解读：\n\n${chartContext}`;
 
-    const stream = await client.messages.create({
-      model: 'claude-opus-4-6',
-      max_tokens: 1024,
-      system: systemWithContext,
-      messages: messages.map(m => ({
-        role: m.role,
-        content: m.content,
-      })),
-      stream: true,
+    const upstream = await fetch('https://api.openai.com/v1/responses', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: process.env.OPENAI_MODEL || 'gpt-6',
+        instructions,
+        input: messages.map(m => ({ role: m.role, content: m.content })),
+        max_output_tokens: 2048,
+        stream: true,
+      }),
     });
 
+    if (!upstream.ok) {
+      const detail = await upstream.text();
+      console.error('OpenAI API error:', upstream.status, detail.slice(0, 2000));
+      return Response.json(
+        { error: `OpenAI API 请求失败（${upstream.status}），请检查 API Key、模型配置和账户额度` },
+        { status: upstream.status === 401 ? 401 : 502 }
+      );
+    }
+    if (!upstream.body) {
+      return new Response('OpenAI 未返回数据流', { status: 502 });
+    }
+
     const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
     const readable = new ReadableStream({
       async start(controller) {
-        for await (const event of stream) {
-          if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
-            const data = JSON.stringify({ delta: { text: event.delta.text } });
-            controller.enqueue(encoder.encode(`data: ${data}\n\n`));
+        const reader = upstream.body!.getReader();
+        let buffer = '';
+        const emit = (text: string) => {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ delta: { text } })}\n\n`));
+        };
+
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            buffer += decoder.decode(value, { stream: !done });
+
+            let boundary = buffer.indexOf('\n\n');
+            while (boundary !== -1) {
+              const block = buffer.slice(0, boundary);
+              buffer = buffer.slice(boundary + 2);
+              const data = block.split('\n')
+                .filter(line => line.startsWith('data:'))
+                .map(line => line.slice(5).trim())
+                .join('\n');
+
+              if (data && data !== '[DONE]') {
+                try {
+                  const event = JSON.parse(data);
+                  if (event.type === 'response.output_text.delta' && typeof event.delta === 'string') {
+                    emit(event.delta);
+                  } else if (event.type === 'response.failed' || event.type === 'error') {
+                    throw new Error(event.response?.error?.message || event.error?.message || 'OpenAI 流式生成失败');
+                  }
+                } catch (error) {
+                  if (error instanceof SyntaxError) {
+                    console.error('无法解析 OpenAI 流事件');
+                  } else {
+                    throw error;
+                  }
+                }
+              }
+              boundary = buffer.indexOf('\n\n');
+            }
+
+            if (done) break;
           }
-          if (event.type === 'message_stop') {
-            controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-            controller.close();
-          }
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          controller.close();
+        } catch (error) {
+          console.error('OpenAI stream error:', error);
+          controller.error(error);
+        } finally {
+          reader.releaseLock();
         }
       },
     });
 
     return new Response(readable, {
       headers: {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
         'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
       },
     });
   } catch (err) {
     console.error('Interpret error:', err);
-    const message = err instanceof Error ? err.message : '解读失败';
-    return new Response(JSON.stringify({ error: message }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return Response.json({ error: '解读服务暂时不可用，请稍后重试' }, { status: 500 });
   }
 }
