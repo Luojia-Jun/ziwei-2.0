@@ -345,7 +345,7 @@ export async function POST(req: NextRequest) {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: process.env.OPENAI_MODEL || 'gpt-6',
+        model: process.env.OPENAI_MODEL || 'gpt-6-astra',
         instructions,
         input: messages.map(m => ({ role: m.role, content: m.content })),
         max_output_tokens: 2048,
